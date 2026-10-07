@@ -1,0 +1,83 @@
+name: Check upstream Worker release
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-worker-update
+  cancel-in-progress: false
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Download and validate upstream release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/IRNova/Nova-Proxy/main/version.json \
+            --output /tmp/upstream-version.json
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/IRNova/Nova-Proxy/main/worker.js \
+            --output /tmp/upstream-worker.js
+          node --input-type=module <<'NODE'
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          const local = JSON.parse(fs.readFileSync('version.json', 'utf8'));
+          const remote = JSON.parse(fs.readFileSync('/tmp/upstream-version.json', 'utf8'));
+          const parts = value => value.split('.').map(Number);
+          const newer = (() => {
+            const a = parts(remote.version), b = parts(local.version);
+            for (let i = 0; i < Math.max(a.length, b.length); i++) {
+              const delta = (a[i] ?? 0) - (b[i] ?? 0);
+              if (delta) return delta > 0;
+            }
+            return false;
+          })();
+          if (!newer) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'has_update=false\n');
+            process.exit(0);
+          }
+          const actual = crypto.createHash('sha256')
+            .update(fs.readFileSync('/tmp/upstream-worker.js')).digest('hex');
+          if (actual !== remote.worker_sha256) {
+            throw new Error('Upstream worker.js does not match version.json SHA-256');
+          }
+          fs.copyFileSync('/tmp/upstream-worker.js', 'worker.js');
+          fs.copyFileSync('/tmp/upstream-version.json', 'version.json');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'has_update=true\n');
+          NODE
+      - name: Validate Worker artifact
+        if: steps.release.outputs.has_update == 'true'
+        run: npm run check
+      - name: Open update pull request
+        if: steps.release.outputs.has_update == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/upstream-worker-release
+          delete-branch: true
+          add-paths: |
+            worker.js
+            version.json
+          commit-message: "chore: update Worker from upstream"
+          title: "chore: update Worker from upstream"
+          body: |
+            A newer Worker release was found in IRNova/Nova-Proxy.
+
+            The workflow checked the upstream SHA-256, JavaScript syntax, and Wrangler dry-run. Review the diff and preview deployment before merging.
